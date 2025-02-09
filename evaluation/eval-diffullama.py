@@ -2,7 +2,7 @@ import torch
 from attention_patch import replace_attention_mask
 
 replace_attention_mask()
-
+from tqdm import tqdm
 from llamafactory.train.ddm.trainer import eval_forward, generate_samples, generate_samples_v2
 from model import DiscreteDiffusionModel
 from argparse import ArgumentParser
@@ -12,6 +12,51 @@ from transformers import AutoConfig, AutoTokenizer, LlamaForCausalLM
 import torch.distributions as dists
 import torch.nn.functional as F
 from f1 import compute_f1, normalize_answer
+
+# These examplars are from the Table 20 of CoT paper (https://arxiv.org/pdf/2201.11903.pdf).
+GSM_EXAMPLARS = [
+    {
+        "question": "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
+        "cot_answer": "There are 15 trees originally. Then there were 21 trees after some more were planted. So there must have been 21 - 15 = 6. So the answer is 6.",
+        "short_answer": "6",
+    },
+    {
+        "question": "If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?",
+        "cot_answer": "There are originally 3 cars. 2 more cars arrive. 3 + 2 = 5. So the answer is 5.",
+        "short_answer": "5",
+    },
+    {
+        "question": "Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?",
+        "cot_answer": "Originally, Leah had 32 chocolates. Her sister had 42. So in total they had 32 + 42 = 74. After eating 35, they had 74 - 35 = 39. So the answer is 39.",
+        "short_answer": "39",
+    },
+    {
+        "question": "Jason had 20 lollipops. He gave Denny some lollipops. Now Jason has 12 lollipops. How many lollipops did Jason give to Denny?",
+        "cot_answer": "Jason started with 20 lollipops. Then he had 12 after giving some to Denny. So he gave Denny 20 - 12 = 8. So the answer is 8.",
+        "short_answer": "8",
+    },
+    {
+        "question": "Shawn has five toys. For Christmas, he got two toys each from his mom and dad. How many toys does he have now?",
+        "cot_answer": "Shawn started with 5 toys. If he got 2 toys each from his mom and dad, then that is 4 more toys. 5 + 4 = 9. So the answer is 9.",
+        "short_answer": "9",
+    },
+    {
+        "question": "There were nine computers in the server room. Five more computers were installed each day, from monday to thursday. How many computers are now in the server room?",
+        "cot_answer": "There were originally 9 computers. For each of 4 days, 5 more computers were added. So 5 * 4 = 20 computers were added. 9 + 20 is 29. So the answer is 29.",
+        "short_answer": "29",
+    },
+    {
+        "question": "Michael had 58 golf balls. On tuesday, he lost 23 golf balls. On wednesday, he lost 2 more. How many golf balls did he have at the end of wednesday?",
+        "cot_answer": "Michael started with 58 golf balls. After losing 23 on tuesday, he had 58 - 23 = 35. After losing 2 more, he had 35 - 2 = 33 golf balls. So the answer is 33.",
+        "short_answer": "33",
+    },
+    {
+        "question": "Olivia has $23. She bought five bagels for $3 each. How much money does she have left?",
+        "cot_answer": "Olivia had 23 dollars. 5 bagels for 3 dollars each will be 5 x 3 = 15 dollars. So she has 23 - 15 dollars left. 23 - 15 is 8. So the answer is 8.",
+        "short_answer": "8",
+    },
+]
+
 
 def get_anneal_attn_mask(seq_len, bsz, dtype, device, attn_mask_ratio):
     mask = torch.full((seq_len, seq_len), 0, device=device)
@@ -98,7 +143,7 @@ def eval_hellaswag(model, tokenizer, args):
     total_cnt = 0
     cor = 0
 
-    for doc in ds:
+    for doc in tqdm(ds):
         total_cnt += 1
         ctx = doc["ctx_a"] + " " + doc["ctx_b"].capitalize()
 
@@ -133,7 +178,7 @@ def eval_wino(model, tokenizer, args):
     total_cnt = 0
     cor = 0
 
-    for doc in ds:
+    for doc in tqdm(ds):
         total_cnt += 1
         
         idx = doc["sentence"].index("_")
@@ -173,7 +218,7 @@ def eval_piqa(model, tokenizer, args):
     total_cnt = 0
     cor = 0
 
-    for doc in ds:
+    for doc in tqdm(ds):
         total_cnt += 1
         
         query = f"Question: {doc['goal']}\nAnswer: "
@@ -205,7 +250,7 @@ def eval_siqa(model, tokenizer, args):
     total_cnt = 0
     cor = 0
 
-    for doc in ds:
+    for doc in tqdm(ds):
         total_cnt += 1
         
         query = f"Question: {doc['context']} {doc['question']}\nAnswer: "
@@ -312,14 +357,14 @@ def humaneval_infill(model, tokenizer, args):
     
 def eval_triva(model, tokenizer, args):
     from datasets import load_dataset
-    # ds = load_dataset("mandarjoshi/trivia_qa", "rc", split='validation')
-    ds = load_dataset("rajpurkar/squad", split='validation')
+    ds = load_dataset("mandarjoshi/trivia_qa", "rc", split='validation')
+    # ds = load_dataset("rajpurkar/squad", split='validation')
     gens = []
     refs = []
     total_cnt = 0
     cor = 0
 
-    for doc in ds:
+    for doc in tqdm(ds):
         total_cnt += 1
         # import pdb; pdb.set_trace();
         query = f"{doc['context']}\nQuesion{doc['question']}?\nAnswer: "
@@ -356,16 +401,156 @@ def eval_triva(model, tokenizer, args):
     print('em acc:', cor/total_cnt)
     print(compute_f1(gens, refs))
 
+def eval_squad(model, tokenizer, args):
+    from datasets import load_dataset
+    from tqdm import tqdm
+    from squad_eval_1 import evaluate as squad_evaluate
+    dataset = load_dataset("squad", split="validation")
+    # only 512 samples
+    dataset = dataset.shuffle(42).select(range(512))
+    squad_shots = [
+        "Architecturally, the school has a Catholic character. Atop the Main Building's gold dome is a golden statue of the Virgin Mary. Immediately in front of the Main Building and facing it, is a copper statue of Christ with arms upraised with the legend \"Venite Ad Me Omnes\". Next to the Main Building is the Basilica of the Sacred Heart. Immediately behind the basilica is the Grotto, a Marian place of prayer and reflection. It is a replica of the grotto at Lourdes, France where the Virgin Mary reputedly appeared to Saint Bernadette Soubirous in 1858. At the end of the main drive (and in a direct line that connects through 3 statues and the Gold Dome), is a simple, modern stone statue of Mary.\n\nTo whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?\n\nSaint Bernadette Soubirous",
+        "Burke was born in Dublin, Ireland. His mother Mary née Nagle (c. 1702 – 1770) was a Roman Catholic who hailed from a déclassé County Cork family (and a cousin of Nano Nagle), whereas his father, a successful solicitor, Richard (died 1761), was a member of the Church of Ireland; it remains unclear whether this is the same Richard Burke who converted from Catholicism. The Burke dynasty descends from an Anglo-Norman knight surnamed de Burgh (latinised as de Burgo) who arrived in Ireland in 1185 following Henry II of England's 1171 invasion of Ireland.\n\nWhere was Burke born?\n\nDublin, Ireland",
+        "The term high definition once described a series of television systems originating from August 1936; however, these systems were only high definition when compared to earlier systems that were based on mechanical systems with as few as 30 lines of resolution. The ongoing competition between companies and nations to create true \"HDTV\" spanned the entire 20th century, as each new system became more HD than the last.In the beginning of the 21st century, this race has continued with 4k, 5k and current 8K systems.\n\nThe term \"high definition\" originally described televisions systems from what year?\n\n1936"
+    ]
+    data = [sample for sample in dataset]
+    preds = []
+    for sample in tqdm(data):
+        query = "\n".join(squad_shots) + '\n' + sample["context"] + "\n\n" + sample["question"]
+        input_ids = tokenizer.encode(query)
+        remaining_len = 2048 - len(input_ids)
+        x0 = input_ids + [0]*remaining_len
+        src_mask = [1]*len(input_ids) + [0]*remaining_len
+        inputs = {"input_ids": torch.tensor([x0]), "src_mask": torch.tensor([src_mask])}
+        res = generate_samples(model, args, tokenizer, inputs, eval=True)
+        pred = tokenizer.decode(res.tolist()[0][len(input_ids)-1:])
+        pred = pred.strip()
+        print(pred)
+        # if we see eos token, truncate
+        if "</s>" in pred:
+            pred = pred[:pred.index("</s>")]
+        if "\n" in pred:
+            pred = pred[:pred.index("\n")]
+        print('xxx', pred)
+        preds.append(pred)
+    predictions = [{"id": y['id'], "prediction_text": x} for x, y in zip(preds, data) if y is not None]
+    references = [{"id": x["id"], "answers": x["answers"]}  for x in data if x is not None]
+    # now calculate the metrics
+    results = squad_evaluate(references=references, predictions=predictions)
+    print(results)
+
+def eval_alpaca(model, tokenizer, args):
+    from alpaca_eval.main import evaluate as alpaca_farm_evaluate
+    from datasets import load_dataset
+    from tqdm import tqdm
+    data = load_dataset("tatsu-lab/alpaca_eval", "alpaca_eval", trust_remote_code=True)["eval"]
+    gens = []
+    data = [sample for sample in data]
+    for sample in tqdm(data):
+        query = sample["instruction"] + "\nResponse: "
+        print(query)
+        input_ids = tokenizer.encode(query)
+        remaining_len = 2048 - len(input_ids)
+        x0 = input_ids + [0]*remaining_len
+        src_mask = [1]*len(input_ids) + [0]*remaining_len
+        inputs = {"input_ids": torch.tensor([x0]), "src_mask": torch.tensor([src_mask])}
+        res = generate_samples(model, args, tokenizer, inputs, eval=True)
+        pred = tokenizer.decode(res.tolist()[0][len(input_ids)-1:])
+        print(pred)
+        # if we see eos token, truncate
+        if "</s>" in pred:
+            pred = pred[:pred.index("</s>")]
+        print(pred)
+        gens.append({
+            "output": pred,
+            "generator": "diffullama",
+            "instruction": sample["instruction"],
+            "dataset": sample["dataset"],
+        })
+    df_leaderboard, _ = alpaca_farm_evaluate(
+        model_outputs=gens,
+        annotators_config="alpaca_eval_gpt4",
+        output_path="tmp",
+        is_return_instead_of_print=True,
+        is_overwrite_leaderboard=True,
+    )
+
+    print(df_leaderboard.to_string(float_format="%.2f"))
+    results_json = {"win_rate": df_leaderboard.to_dict()["win_rate"]["diffullama"]}
+    print(results_json)
+    with open(args.output_file, "w") as f:
+        json.dump(gens, f)
+
+
+def eval_gsm8k(model, tokenizer, args):
+    from datasets import load_dataset
+    exact_match = evaluate.load("exact_match")
+    from tqdm import tqdm
+    gsm = load_dataset("openai/gsm8k", "main", split='test')
+    global GSM_EXAMPLARS
+    demonstrations = []
+    for example in GSM_EXAMPLARS:
+        demonstrations.append("Question: " + example["question"] + "\n" + "Answer: " + example["cot_answer"])
+    prompt_prefix = "Answer the following questions.\n\n" + "\n\n".join(demonstrations) + "\n\n"
+    final_preds = []
+    answers = []
+    count = 0
+    # split the gsm data into 6 chunks, and take args.shard_num-th chunk
+    gsm = [x for x in gsm]
+    outputs = []
+    for sample in tqdm(gsm):
+        query = prompt_prefix + sample["question"]
+        input_ids = tokenizer.encode(query)
+        remaining_len = 2048 - len(input_ids)
+        x0 = input_ids + [0]*remaining_len
+        src_mask = [1]*len(input_ids) + [0]*remaining_len
+        inputs = {"input_ids": torch.tensor([x0]), "src_mask": torch.tensor([src_mask])}
+        with torch.no_grad():
+            res = generate_samples(model, args, tokenizer, inputs, eval=True)
+        pred = tokenizer.decode(res.tolist()[0][len(input_ids)-1:])
+        pred = pred.strip()
+        if 'question' in pred.lower():
+            pred = pred[:pred.lower().index("question")]
+        print(pred)
+        outputs.append({
+            "output": pred,
+            "generator": "diffullama",
+            "question": sample["question"],
+        })
+        sample_answer = sample["answer"].split("###")[-1].strip()
+        # replace numbers like `x,xxx` with `xxxx`
+        try:
+          pred = re.sub(r"(\d),(\d)", r"\1\2", pred)
+          numbers = re.findall(r"[-+]?\d*\.\d+|\d+", pred)
+          if numbers:
+            final_pred = numbers[-1]
+          else:
+            final_pred = pred
+        except:
+            final_pred = pred
+        final_preds.append(final_pred)
+        answers.append(sample_answer)
+        count += 1
+    em_score = exact_match.compute(
+        predictions=final_preds, references=answers, ignore_case=True, ignore_punctuation=True
+    )["exact_match"]
+    print(f"Exact match : {em_score}")
+    print(f"Total count : {count}")
+    with open(args.output_file, "w") as f:
+        json.dump(outputs, f)
+
+
 def main():
     parser = ArgumentParser()
-    parser.add_argument("--model_name", type=str, default='diffusionfamily/diffullama')
+    parser.add_argument("--model_name", type=str, default='LLaMA-Factory/output/llama-tulu-v2-sft/')
     parser.add_argument("--shift", type=bool, default=True) # do not change this
-    parser.add_argument("--diffusion_steps", type=int, default=32)
+    parser.add_argument("--diffusion_steps", type=int, default=100)
     parser.add_argument("--logits_temp", type=float, default=0.9)
     parser.add_argument("--topp_temp", type=float, default=0.9)
     parser.add_argument("--verbose", type=bool, default=False) # print middle state
     parser.add_argument("--flash_attn", type=str, choices=["eager", "sdpa", "flash_attention_2"], default="eager") # print middle state
-
+    parser.add_argument("--shard_num", type=int)
+    parser.add_argument("--output_file", type=str, default="res.json")
     args = parser.parse_args()
 
     # model_name = 'gpt2'  # 'gpt2-medium', 'gpt2-large'
@@ -386,15 +571,26 @@ def main():
         tokenizer=tokenizer,
         device='cuda'
     ).to('cuda')
+    # model = DiscreteDiffusionModel(args.base_model_name, config, tokenizer)
+
+    # model = DiscreteDiffusionModel(
+    #     model=model, 
+    #     config=config, 
+    #     tokenizer=tokenizer,
+    #     device='cuda'
+    # ).to('cuda')
 
     # eval_Lambada(model, tokenizer, args)
-    eval_hellaswag(model, tokenizer, args)
-    # humaneval_infill(model, tokenizer, args)
+    #eval_hellaswag(model, tokenizer, args)
+    humaneval_infill(model, tokenizer, args)
     # eval_infilling(model, tokenizer, args)
-    eval_wino(model, tokenizer, args)
-    eval_siqa(model, tokenizer, args)
-    eval_piqa(model, tokenizer, args)
-    # eval_triva(model, tokenizer, args)
+    #eval_wino(model, tokenizer, args)
+    #eval_siqa(model, tokenizer, args)
+    #eval_piqa(model, tokenizer, args)
+    eval_triva(model, tokenizer, args)
+    # eval_alpaca(model, tokenizer, args)
+    #eval_gsm8k(model, tokenizer, args)
+    # eval_squad(model, tokenizer, args)
 
 if __name__ == "__main__":
     main()
