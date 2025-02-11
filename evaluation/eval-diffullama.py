@@ -363,12 +363,16 @@ def eval_triva(model, tokenizer, args):
     refs = []
     total_cnt = 0
     cor = 0
-
+    triviaqa_shots = [
+      "Which American-born Sinclair won the Nobel Prize for Literature in 1930?\n\n(Harry) Sinclair Lewis",
+      "Where in England was Dame Judi Dench born?\n\nYork, England",
+    ]
     for doc in tqdm(ds):
         total_cnt += 1
         # import pdb; pdb.set_trace();
-        query = f"{doc['context']}\nQuesion{doc['question']}?\nAnswer: "
-        labels = doc["answers"]["text"]
+        query =  "\n".join(triviaqa_shots) + "\n\n" + doc["question"] #f"Quesion{doc['question']}?\nAnswer: "
+        query = "<|user|>\n" + query.strip() + "\n<|assistant|>\n"
+        labels = doc["answer"]["aliases"]
         encoded_labels = [tokenizer.encode(l, add_special_tokens=False) for l in labels]
         long_gold = max(encoded_labels, key=len)
 
@@ -539,6 +543,103 @@ def eval_gsm8k(model, tokenizer, args):
     with open(args.output_file, "w") as f:
         json.dump(outputs, f)
 
+def eval_bbh(model, tokenizer, args):
+    """Evaluate model on Big Bench Hard tasks."""
+    import os
+    import json
+    import glob
+    import random
+    from tqdm import tqdm
+    import evaluate
+
+    random.seed(42)
+    exact_match = evaluate.load("exact_match")
+
+    # Load all tasks and prompts
+    all_tasks = {}
+    task_files = glob.glob(os.path.join("evaluation/bbh/bbh", "*.json"))
+    for task_file in tqdm(task_files, desc="Loading tasks"):
+        with open(task_file, "r") as f:
+            task_name = os.path.basename(task_file).split(".")[0]
+            all_tasks[task_name] = json.load(f)["examples"]
+
+    all_prompts = {}
+    cot_prompt_files = glob.glob(os.path.join("evaluation/bbh/cot-prompts", "*.txt"))
+    for cot_prompt_file in tqdm(cot_prompt_files, desc="Loading prompts"):
+        with open(cot_prompt_file, "r") as f:
+            task_name = os.path.basename(cot_prompt_file).split(".")[0]
+            task_prompt = "".join(f.readlines()[2:])
+            all_prompts[task_name] = task_prompt
+
+    assert set(all_tasks.keys()) == set(all_prompts.keys()), "Task names mismatch between data and prompts"
+
+    # Create output directories
+    os.makedirs("results/bbh", exist_ok=True)
+    os.makedirs("results/bbh/predictions", exist_ok=True)
+
+    performance = {}
+    for task_name in tqdm(all_tasks.keys(), desc="Evaluating"):
+        task_examples = all_tasks[task_name]
+        task_prompt = all_prompts[task_name]
+
+        # Prepare prompts
+        prompts = ["<|user|>\n" + task_prompt.strip() + "\n\nQ: " + example["input"] + "\n<|assistant|>\nA:" for example in task_examples]
+        #prompts = [task_prompt.strip() + "\n\nQ: " + example["input"] + "\nA:" for example in task_examples]
+        predictions = []
+        outputs = []
+        targets = [example["target"] for example in task_examples]
+
+        for prompt in tqdm(prompts):
+            input_ids = tokenizer.encode(prompt)
+            remaining_len = 2048 - len(input_ids)
+            x0 = input_ids + [0] * remaining_len
+            src_mask = [1] * len(input_ids) + [0] * remaining_len
+            inputs = {"input_ids": torch.tensor([x0]), "src_mask": torch.tensor([src_mask])}
+
+            # Generate using the diffusion model
+            res = generate_samples(model, args, tokenizer, inputs, eval=True)
+            output = tokenizer.decode(res.tolist()[0][len(input_ids)-1:])
+            outputs.append(output)
+            # Extract answer using regex pattern
+            import re
+            extracted_answer = re.search(r"[t|T]he answer is (.*?)\.", output)
+            if extracted_answer:
+                prediction = extracted_answer.group(1).strip()
+            else:
+                prediction = output.strip()
+            predictions.append(prediction)
+
+        # Save predictions
+        examples_with_predictions = []
+        for example, prediction, output in zip(task_examples, predictions, outputs):
+            example_dict = example.copy()
+            example_dict["prediction"] = prediction
+            example_dict["raw_output"] = output
+            examples_with_predictions.append(example_dict)
+
+        with open(os.path.join("results/bbh/predictions", f"{task_name}.jsonl"), "w") as fout:
+            for example in examples_with_predictions:
+                fout.write(json.dumps(example) + "\n")
+
+        # Calculate metrics
+        score = exact_match.compute(
+            predictions=predictions,
+            references=targets,
+            ignore_case=True,
+            ignore_punctuation=True
+        )["exact_match"]
+
+        performance[task_name] = score
+        print(f"Task {task_name} - EM: {score}")
+
+    # Save overall performance
+    performance["average_exact_match"] = sum(performance.values()) / len(performance)
+    print(f"Average EM: {performance['average_exact_match']}")
+
+    with open(os.path.join("results/bbh", "metrics.json"), "w") as fout:
+        json.dump(performance, fout, indent=4)
+
+    return performance
 
 def main():
     parser = ArgumentParser()
@@ -580,14 +681,15 @@ def main():
     #     device='cuda'
     # ).to('cuda')
 
+    eval_bbh(model, tokenizer, args)
     # eval_Lambada(model, tokenizer, args)
     #eval_hellaswag(model, tokenizer, args)
-    humaneval_infill(model, tokenizer, args)
+    #humaneval_infill(model, tokenizer, args)
     # eval_infilling(model, tokenizer, args)
     #eval_wino(model, tokenizer, args)
     #eval_siqa(model, tokenizer, args)
     #eval_piqa(model, tokenizer, args)
-    eval_triva(model, tokenizer, args)
+    #eval_triva(model, tokenizer, args)
     # eval_alpaca(model, tokenizer, args)
     #eval_gsm8k(model, tokenizer, args)
     # eval_squad(model, tokenizer, args)
