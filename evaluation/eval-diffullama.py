@@ -1,4 +1,8 @@
 import torch
+import collections
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
 from attention_patch import replace_attention_mask
 
 replace_attention_mask()
@@ -12,6 +16,9 @@ from transformers import AutoConfig, AutoTokenizer, LlamaForCausalLM
 import torch.distributions as dists
 import torch.nn.functional as F
 from f1 import compute_f1, normalize_answer
+from evaluation.ifeval import test_instruction_following_strict, test_instruction_following_loose, load_ifeval_prompts
+from datasets import load_dataset
+from evaluation.codex_evaluation import evaluate_functional_correctness, write_jsonl
 
 # These examplars are from the Table 20 of CoT paper (https://arxiv.org/pdf/2201.11903.pdf).
 GSM_EXAMPLARS = [
@@ -641,6 +648,325 @@ def eval_bbh(model, tokenizer, args):
 
     return performance
 
+
+
+def calculate_scores(outputs):
+    """Helper function to calculate accuracy scores from outputs.
+    
+    Args:
+        outputs (list): List of OutputExample objects
+        
+    Returns:
+        dict: Dictionary containing accuracy metrics
+    """
+    if not outputs:
+        return {
+            "prompt_level_accuracy": 0.0,
+            "instruction_level_accuracy": 0.0,
+            "per_instruction_accuracy": {}
+        }
+        
+    prompt_total = len(outputs)
+    prompt_correct = sum(1 for o in outputs if o.follow_all_instructions)
+    
+    instruction_total = sum(len(o.instruction_id_list) for o in outputs)
+    instruction_correct = sum(sum(o.follow_instruction_list) for o in outputs)
+
+    # Calculate per-instruction accuracies
+    instruction_metrics = collections.defaultdict(lambda: {"total": 0, "correct": 0})
+    
+    for output in outputs:
+        for inst_id, followed in zip(output.instruction_id_list, output.follow_instruction_list):
+            instruction_metrics[inst_id]["total"] += 1
+            if followed:
+                instruction_metrics[inst_id]["correct"] += 1
+
+    return {
+        "prompt_level_accuracy": prompt_correct / prompt_total,
+        "instruction_level_accuracy": instruction_correct / instruction_total,
+        "per_instruction_accuracy": {
+            k: v["correct"] / v["total"] 
+            for k, v in instruction_metrics.items()
+        }
+    }
+
+def eval_ifeval(model, tokenizer, args):
+    """Evaluates model on instruction following tasks.
+    
+    Args:
+        model: The model to evaluate
+        tokenizer: The tokenizer to use
+        args: Additional arguments for evaluation
+        
+    Returns:
+        dict: Dictionary containing evaluation metrics
+    """
+    # Read input data
+    input_data = load_ifeval_prompts()
+    
+    strict_outputs = []
+    loose_outputs = []
+    
+    for inp in tqdm(input_data):
+        # Format prompt
+        prompt = inp.prompt
+        if args.use_chat_format:
+            formatted_prompt = f"<|user|>\n{prompt}\n<|assistant|>\n"
+        else:
+            formatted_prompt = f"{prompt}\n\n### Response:\n"
+
+        # Tokenize
+        input_ids = tokenizer.encode(formatted_prompt)
+        remaining_len = 2048 - len(input_ids)
+        x0 = input_ids + [0] * remaining_len
+        src_mask = [1] * len(input_ids) + [0] * remaining_len
+        inputs = {"input_ids": torch.tensor([x0]), "src_mask": torch.tensor([src_mask])}
+        
+        # Generate response
+        res = generate_samples(model, args, tokenizer, inputs, eval=True)
+        pred = tokenizer.decode(res.tolist()[0][len(input_ids)-1:])
+        
+        # Test instruction following
+        strict_result = test_instruction_following_strict(inp, {inp.prompt: pred})
+        strict_outputs.append(strict_result)
+        
+        loose_result = test_instruction_following_loose(inp, {inp.prompt: pred})
+        loose_outputs.append(loose_result)
+    
+    # Calculate metrics
+    metrics = {}
+    strict_metrics = calculate_scores(strict_outputs)
+    for k, v in strict_metrics.items():
+        metrics[f"strict_{k}"] = v
+    
+    loose_metrics = calculate_scores(loose_outputs)
+    for k, v in loose_metrics.items():
+        metrics[f"loose_{k}"] = v
+        
+    print(metrics)
+    return metrics
+
+def eval_mmlu(model, tokenizer, args):
+    """Evaluates model on MMLU tasks."""
+
+    # Categories and subcategories from the mmlu_utils
+    categories = {
+        "STEM": ["abstract_algebra", "astronomy", "college_biology", "college_chemistry", "college_computer_science", 
+                 "college_mathematics", "college_physics", "computer_security", "conceptual_physics", "electrical_engineering", 
+                 "elementary_mathematics", "high_school_biology", "high_school_chemistry", "high_school_computer_science", 
+                 "high_school_mathematics", "high_school_physics", "high_school_statistics", "machine_learning"],
+        "Humanities": ["formal_logic", "high_school_european_history", "high_school_us_history", "high_school_world_history", 
+                      "high_school_government_and_politics", "history", "international_law", "jurisprudence", "logical_fallacies", 
+                      "moral_disputes", "moral_scenarios", "philosophy", "prehistory", "professional_law", "world_religions"],
+        "Social Sciences": ["econometrics", "high_school_geography", "high_school_macroeconomics", "high_school_microeconomics", 
+                          "high_school_psychology", "human_sexuality", "professional_psychology", "public_relations", "security_studies", 
+                          "sociology", "us_foreign_policy"],
+        "Other": ["business_ethics", "clinical_knowledge", "college_medicine", "global_facts", "human_aging", "management", 
+                 "marketing", "medical_genetics", "miscellaneous", "nutrition", "professional_accounting", "professional_medicine", 
+                 "virology"]
+    }
+
+    # Helper functions for formatting
+    def format_subject(subject):
+        return " ".join(subject.split("_"))
+
+    def format_example(df, idx, include_answer=True):
+        prompt = df.iloc[idx, 0]
+        k = df.shape[1] - 2
+        choices = ["A", "B", "C", "D"]
+        for j in range(k):
+            prompt += f"\n{choices[j]}. {df.iloc[idx, j + 1]}"
+        if args.use_chat_format:
+            prompt = "<|user|>\n" + prompt + "\n<assistant|>"
+        prompt += "\nAnswer:"
+        if include_answer:
+            prompt += f" {df.iloc[idx, k + 1]}\n\n"
+        return prompt
+
+    def gen_prompt(train_df, subject, k=-1):
+        prompt = f"The following are multiple choice questions (with answers) about {format_subject(subject)}.\n\n"
+        if k == -1:
+            k = train_df.shape[0]
+        for i in range(k):
+            prompt += format_example(train_df, i)
+        return prompt
+
+    # Initialize metrics tracking
+    all_cors = []
+    subcat_cors = {subcat: [] for subcats in categories.values() for subcat in subcats}
+    cat_cors = {cat: [] for cat in categories}
+
+    # Get list of all subjects
+    subjects = []
+    for category_subjects in categories.values():
+        subjects.extend(category_subjects)
+    subjects = sorted(subjects)
+
+    total_count = 0
+    correct_count = 0
+
+    for subject in tqdm(subjects):
+        try:
+            # Load development and test data
+            dev_df = pd.read_csv(f"evaluation/mmlu_data/data/dev/{subject}_dev.csv", header=None)
+            test_df = pd.read_csv(f"evaluation/mmlu_data/data/test/{subject}_test.csv", header=None)
+            
+            # Process each test example
+            for i in range(len(test_df)):
+                k = 0  # Number of few-shot examples
+                prompt_end = format_example(test_df, i, include_answer=False)
+                train_prompt = gen_prompt(dev_df, subject, k)
+                prompt = train_prompt + prompt_end
+
+                # Format for model
+                input_ids = tokenizer.encode(prompt)
+                remaining_len = 2048 - len(input_ids)
+                x0 = input_ids + [0] * remaining_len
+                src_mask = [1] * len(input_ids) + [0] * remaining_len
+                inputs = {"input_ids": torch.tensor([x0]), "src_mask": torch.tensor([src_mask])}
+
+                # Generate using the model
+                res = generate_samples(model, args, tokenizer, inputs, eval=True)
+                pred = tokenizer.decode(res.tolist()[0][len(input_ids)-1:]).strip()
+
+                # Extract prediction (first character if it's A, B, C, or D)
+                if pred and pred[0] in ["A", "B", "C", "D"]:
+                    prediction = pred[0]
+                else:
+                    prediction = "A"  # Default to first choice if invalid
+
+                # Get ground truth
+                ground_truth = test_df.iloc[i, -1]
+                correct = prediction == ground_truth
+                
+                # Update metrics
+                all_cors.append(correct)
+                total_count += 1
+                if correct:
+                    correct_count += 1
+
+                # Update category metrics
+                for cat, subcats in categories.items():
+                    if subject in subcats:
+                        cat_cors[cat].append(correct)
+                        subcat_cors[subject].append(correct)
+
+        except Exception as e:
+            print(f"Error processing subject {subject}: {str(e)}")
+            continue
+
+    # Calculate and print metrics
+    metrics = {
+        "average_accuracy": np.mean(all_cors),
+        "total_count": total_count,
+        "correct_count": correct_count
+    }
+
+    # Calculate category-level accuracies
+    for cat in categories:
+        if cat_cors[cat]:
+            metrics[f"{cat.lower()}_accuracy"] = np.mean(cat_cors[cat])
+
+    # Calculate subject-level accuracies
+    for subject in subjects:
+        if subcat_cors[subject]:
+            metrics[f"{subject}_accuracy"] = np.mean(subcat_cors[subject])
+
+    print("\nOverall Results:")
+    print(f"Average Accuracy: {metrics['average_accuracy']:.3f}")
+    print(f"Total Questions: {metrics['total_count']}")
+    print(f"Correct Answers: {metrics['correct_count']}")
+    
+    print("\nCategory Results:")
+    for cat in categories:
+        if cat_cors[cat]:
+            print(f"{cat}: {np.mean(cat_cors[cat]):.3f}")
+
+    return metrics
+
+
+def eval_human_eval_ar(model, tokenizer, args):
+    """Evaluates model on HumanEval code generation tasks.
+    
+    Follows the implementation from the CodexHumanEval class but adapted to match
+    other evaluation function styles in the codebase.
+    """
+
+    # Load datasets
+    eval_dataset = load_dataset("openai/openai_humaneval", split="test")
+    instructions = load_dataset("bigcode/humanevalpack", "python")["test"]
+    
+    # Create instructions dictionary
+    instructions_dict = {
+        x["task_id"].replace("Python", "HumanEval"): x["instruction"] 
+        for x in instructions
+    }
+    
+    total_cnt = 0
+    predictions = []
+    generated_solutions = set()
+    answer = "Here is the function:\n\n```python\n"
+    
+    for doc in tqdm(eval_dataset):
+        total_cnt += 1
+        query = instructions_dict[doc["task_id"]]
+        if args.use_chat_format:
+            query = f"<|user|>\n{query}\n<|assistant|>\n{answer}{doc['prompt']}"
+        else:
+            query = f"{query}\n\n### Response:\n{answer}{doc['prompt']}"
+
+        input_ids = tokenizer.encode(query)
+        remaining_len = 2048 - len(input_ids)
+        x0 = input_ids + [0] * remaining_len
+        src_mask = [1] * len(input_ids) + [0] * remaining_len
+        inputs = {"input_ids": torch.tensor([x0]), "src_mask": torch.tensor([src_mask])}
+        
+        # Generate using the diffusion model
+        res = generate_samples(model, args, tokenizer, inputs, eval=True)
+        pred = tokenizer.decode(res.tolist()[0][len(input_ids)-1:])
+        
+        # Add a space at start to preserve indentation
+        pred = " " + pred
+        
+        # Cut off at stop sequences
+        stop_sequences = ["\nclass", "\ndef", "\n#", "\nif", "\nprint", "\n```"]
+        for stop_seq in stop_sequences:
+            if stop_seq in pred:
+                pred = pred.split(stop_seq)[0]
+        
+        predictions.append({
+            "task_id": doc["task_id"],
+            "prompt": doc["prompt"],
+            "completion": pred
+        })
+        generated_solutions.add(doc["task_id"])
+        
+        if args.verbose:
+            print(f"Generated solution for {doc['task_id']}:")
+            print(pred)
+            print("-" * 80)
+
+    # Save predictions for evaluation
+    prediction_save_path = "codex_human_eval_predictions.jsonl"
+    write_jsonl(prediction_save_path, predictions)
+    
+    # Calculate metrics
+    problems = {
+        example["task_id"]: example 
+        for example in eval_dataset 
+        if example["task_id"] in generated_solutions
+    }
+    
+    metrics = evaluate_functional_correctness(
+        sample_file=prediction_save_path,
+        k=[1, 10, 20], 
+        problems=problems,
+        n_workers=64
+    )
+    
+    print('Results:', metrics)
+    return metrics
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--model_name", type=str, default='LLaMA-Factory/output/llama-tulu-v2-sft/')
@@ -652,6 +978,7 @@ def main():
     parser.add_argument("--flash_attn", type=str, choices=["eager", "sdpa", "flash_attention_2"], default="eager") # print middle state
     parser.add_argument("--shard_num", type=int)
     parser.add_argument("--output_file", type=str, default="res.json")
+    parser.add_argument("--use_chat_format", action="store_true")
     args = parser.parse_args()
 
     # model_name = 'gpt2'  # 'gpt2-medium', 'gpt2-large'
@@ -681,7 +1008,7 @@ def main():
     #     device='cuda'
     # ).to('cuda')
 
-    eval_bbh(model, tokenizer, args)
+    # eval_bbh(model, tokenizer, args)
     # eval_Lambada(model, tokenizer, args)
     #eval_hellaswag(model, tokenizer, args)
     #humaneval_infill(model, tokenizer, args)
@@ -693,6 +1020,9 @@ def main():
     # eval_alpaca(model, tokenizer, args)
     #eval_gsm8k(model, tokenizer, args)
     # eval_squad(model, tokenizer, args)
+    eval_ifeval(model, tokenizer, args)
+    eval_mmlu(model, tokenizer, args)
+    eval_human_eval_ar(model, tokenizer, args)
 
 if __name__ == "__main__":
     main()
