@@ -25,7 +25,7 @@ class OutputExample:
 def load_ifeval_prompts():
     """Read inputs from jsonl."""
     inputs = []
-    with open("sdlm/data/instruction_evals/ifeval_input_data.jsonl", "r") as f:
+    with open("evaluation/ifeval_input_data.jsonl", "r") as f:
         for l in f:
             example = json.loads(l)
             inputs.append(
