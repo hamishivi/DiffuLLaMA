@@ -2,7 +2,7 @@ import dataclasses
 import json
 from typing import Dict, List, Optional, Union
 
-import evaluation.ifeval_instruction_registry as instructions_registry
+import evaluation.ifeval_instructions_registry as instructions_registry
 
 
 @dataclasses.dataclass
